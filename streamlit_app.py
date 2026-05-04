@@ -1,25 +1,18 @@
 """
-Supplier PO Size Chart Extractor  –  v3
+Supplier PO Size Chart Extractor  –  v4
 ---------------------------------------
-Root cause fix: Page 4 size tables are EMBEDDED AS IMAGES in this PDF —
-pdfplumber cannot extract them as text. Solution: the two known size charts
-for this specific PO format (PN007-010 and PN002-006) are built-in and
-displayed instantly, always correct.
-
-PO style table (PMY rows) IS parseable as text and is extracted live.
-
-Features:
-  📊 Dashboard  – KPIs, fabric breakdown, top styles
-  📋 Size Charts – always-correct measurement tables (image-embedded data)
-  🧾 PO Styles   – all 32 style variants with search + filter
-  📌 Compare     – side-by-side chart comparison with Δ diff
-  📤 Export      – Excel download (PO rows + size charts)
+Changes vs v3:
+- Generic style prefixes (PMY/TF/SW/TVJ/TVS/TV, configurable).
+- Line-level validation with status (OK / mismatch / missing fields / bad code).
+- Global validation banner for total qty and amount.
+- Still uses built-in size charts for known kids pants spec,
+  but PO table parsing and validation are now more generic & safe.
 """
 
 import io
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import pdfplumber
@@ -51,13 +44,30 @@ h1,h2,h3 { font-family: 'IBM Plex Mono', monospace !important; letter-spacing: -
           font-family:'IBM Plex Mono',monospace; font-size:12px; color:#7c9eff; }
 .notice { background:#1c2a1c; border:1px solid #2d4a2d; border-radius:6px;
           padding:10px 14px; font-size:13px; color:#86efac; margin-bottom:12px; }
+.status-ok { background:#022c22; color:#6ee7b7; padding:3px 6px; border-radius:4px; font-size:11px; }
+.status-warn { background:#451a03; color:#fdba74; padding:3px 6px; border-radius:4px; font-size:11px; }
+.status-err { background:#450a0a; color:#fecaca; padding:3px 6px; border-radius:4px; font-size:11px; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# BUILT-IN SIZE CHARTS  (image-embedded data from page 4 of this PO format)
-# These are fixed for PO 102-SY0002 / SI4大童长裤
+# CONFIG / CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Style code prefixes allowed; make this editable if you want per-supplier config
+ALLOWED_PREFIXES = ["PMY", "TF", "SW", "TVJ", "TVS", "TV"]
+
+
+def is_valid_style_code(code: str) -> bool:
+    code = (code or "").strip().upper()
+    if not code:
+        return False
+    return any(code.startswith(p) for p in ALLOWED_PREFIXES)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUILT-IN SIZE CHARTS  (known verified spec)
 # ═════════════════════════════════════════════════════════════════════════════
 
 BUILTIN_CHARTS = [
@@ -101,7 +111,7 @@ def chart_to_df(chart: dict) -> pd.DataFrame:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PO TABLE PARSER  (pages 1–2 are proper text tables)
+# PO TABLE PARSER + VALIDATION
 # ═════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -114,6 +124,7 @@ class POStyle:
     qty: str
     price: str
     amount: str
+    status: str  # "OK", "MISMATCH", "MISSING_FIELDS", "BAD_CODE"
 
 
 def clean(v) -> str:
@@ -121,13 +132,30 @@ def clean(v) -> str:
 
 
 def parse_sizes(raw: str) -> List[str]:
+    raw = raw or ""
+    # pattern like "24 (7-8)" / "24（7-8）"
     tokens = re.findall(r"\d{2}[（(]\d+-\d+[）)]", raw)
     if tokens:
-        return [t.replace("（","(").replace("）",")") for t in tokens]
+        return [t.replace("（", "(").replace("）", ")") for t in tokens]
+    # pattern like "7-8"
     tokens = re.findall(r"\d+-\d+", raw)
     if tokens:
         return tokens
-    return re.findall(r"\d+", raw.split("\n")[0])
+    # pattern like S, M, L, XL, 2XL etc.
+    tokens = re.findall(r"\b(?:[XSML]{1,3}\d*|[0-9]{2})\b", raw.split("\n")[0])
+    return tokens
+
+
+def safe_float(x: str) -> Optional[float]:
+    if x is None:
+        return None
+    s = str(x).replace("¥", "").replace(",", "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 def parse_po(file_bytes: bytes) -> List[POStyle]:
@@ -139,14 +167,18 @@ def parse_po(file_bytes: bytes) -> List[POStyle]:
             for tbl in (page.extract_tables() or []):
                 if not tbl:
                     continue
-                if "码数" in " ".join(str(c) for c in (tbl[0] or [])):
+                # skip clear non-PO table like kids size chart headers, etc.
+                header_join = " ".join(str(c) for c in (tbl[0] or []))
+                if "码数" in header_join or "SIZE CHART" in header_join.upper():
                     continue
                 for row in tbl:
                     all_rows.append([clean(c) for c in row])
 
+    # find header row (generic)
     hdr_idx = next(
         (i for i, r in enumerate(all_rows)
-         if "STYLE" in " ".join(r) and "DESCRIPTION" in " ".join(r)),
+         if any("STYLE" in c.upper() or "货号" in c for c in r)
+         and any("COLOR" in c.upper() or "颜色" in c for c in r)),
         None,
     )
     if hdr_idx is None:
@@ -156,24 +188,24 @@ def parse_po(file_bytes: bytes) -> List[POStyle]:
 
     def ci(kws):
         for j, h in enumerate(hdr):
-            if any(k.upper() in h.upper() for k in kws):
+            h_up = (h or "").upper()
+            if any(k.upper() in h_up for k in kws):
                 return j
         return None
 
-    c_sty = ci(["STYLE"])
-    c_dsc = ci(["DESCRIPTION"])
-    c_col = ci(["COLOR"])
-    c_qty = ci(["QTY", "T'QTY"])
-    c_prc = ci(["PRICE"])
-    c_amt = ci(["AMOUNT"])
-    c_fab = ci(["FABRIC"])
-    c_siz = ci(["SIZE"])
+    c_sty = ci(["STYLE", "货号"])
+    c_dsc = ci(["DESCRIPTION", "品名", "PRODUCT"])
+    c_col = ci(["COLOR", "颜色"])
+    c_qty = ci(["QTY", "T'QTY", "数量"])
+    c_prc = ci(["PRICE", "单价"])
+    c_amt = ci(["AMOUNT", "金额"])
+    c_fab = ci(["FABRIC", "面料"])
+    c_siz = ci(["SIZE", "码数"])
 
     if c_sty is None or c_col is None:
         return []
 
     cur_dsc = cur_fab = cur_siz = ""
-    pat = re.compile(r"^(PMY|TF|SW)\d+", re.I)
 
     for row in all_rows[hdr_idx + 1:]:
         if not any(row):
@@ -182,21 +214,55 @@ def parse_po(file_bytes: bytes) -> List[POStyle]:
         def g(col):
             return row[col] if col is not None and col < len(row) else ""
 
-        if c_dsc is not None and g(c_dsc): cur_dsc = g(c_dsc)
-        if c_fab is not None and g(c_fab): cur_fab = g(c_fab)
-        if c_siz is not None and g(c_siz): cur_siz = g(c_siz)
+        if c_dsc is not None and g(c_dsc):
+            cur_dsc = g(c_dsc)
+        if c_fab is not None and g(c_fab):
+            cur_fab = g(c_fab)
+        if c_siz is not None and g(c_siz):
+            cur_siz = g(c_siz)
 
-        code  = g(c_sty)
+        code = g(c_sty)
         color = g(c_col)
-        if not code or not pat.match(code) or not color:
+
+        # basic skip
+        if not code and not color:
             continue
 
+        # determine status
+        status = "OK"
+
+        if not is_valid_style_code(code):
+            status = "BAD_CODE"
+
+        if not code or not color:
+            status = "MISSING_FIELDS"
+
+        qty_str = g(c_qty)
+        price_str = g(c_prc)
+        amt_str = g(c_amt)
+
+        qty_val = safe_float(qty_str)
+        price_val = safe_float(price_str)
+        amt_val = safe_float(amt_str)
+
+        if qty_val is not None and price_val is not None and amt_val is not None:
+            expected = round(qty_val * price_val, 2)
+            # allow small rounding difference
+            if abs(expected - amt_val) > 0.5:
+                status = "MISMATCH"
+
         styles.append(POStyle(
-            code=code, product=cur_dsc or "BOY LONG PANTS",
-            color=color, fabric=cur_fab,
+            code=code,
+            product=cur_dsc or "GARMENT",
+            color=color,
+            fabric=cur_fab,
             sizes=parse_sizes(cur_siz),
-            qty=g(c_qty), price=g(c_prc), amount=g(c_amt),
+            qty=qty_str,
+            price=price_str,
+            amount=amt_str,
+            status=status,
         ))
+
     return styles
 
 
@@ -208,6 +274,48 @@ def get_raw_text(file_bytes: bytes, n: int = 5000) -> str:
     return "\n\n".join(parts)[:n]
 
 
+def validate_po(styles: List[POStyle]) -> Dict[str, any]:
+    """
+    Global validation summary.
+    """
+    total_qty = 0.0
+    total_amt = 0.0
+    any_mismatch = False
+    any_bad = False
+
+    for s in styles:
+        q = safe_float(s.qty)
+        a = safe_float(s.amount)
+        if q is not None:
+            total_qty += q
+        if a is not None:
+            total_amt += a
+        if s.status in ("MISMATCH", "MISSING_FIELDS", "BAD_CODE"):
+            any_bad = True
+        if s.status == "MISMATCH":
+            any_mismatch = True
+
+    status = "OK"
+    msg = "All parsed rows passed basic checks."
+    if not styles:
+        status = "EMPTY"
+        msg = "No PO style rows parsed from PDF."
+    elif any_mismatch:
+        status = "MISMATCH"
+        msg = "Some lines have qty × price ≠ amount. Please review highlighted rows."
+    elif any_bad:
+        status = "WARN"
+        msg = "Some rows have missing fields or unusual style codes. Please review."
+
+    return {
+        "status": status,
+        "message": msg,
+        "total_qty": total_qty,
+        "total_amt": total_amt,
+        "count": len(styles),
+    }
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # EXCEL EXPORT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -215,22 +323,24 @@ def get_raw_text(file_bytes: bytes, n: int = 5000) -> str:
 def build_excel(styles: List[POStyle]) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # Sheet 1 – PO rows
+        # Sheet 1 – PO rows with validation status
         rows = []
         for s in styles:
-            amt = s.amount.replace("¥","").replace(",","").strip()
-            try:
-                amt_val = float(amt)
-            except ValueError:
-                amt_val = s.amount
+            amt_val = safe_float(s.amount)
             rows.append({
-                "Style Code": s.code, "Product": s.product, "Color": s.color,
-                "Fabric": s.fabric, "Sizes": ", ".join(s.sizes),
-                "Qty": s.qty, "Unit Price": s.price, "Amount (¥)": amt_val,
+                "Style Code": s.code,
+                "Product": s.product,
+                "Color": s.color,
+                "Fabric": s.fabric,
+                "Sizes": ", ".join(s.sizes),
+                "Qty": s.qty,
+                "Unit Price": s.price,
+                "Amount (¥)": amt_val if amt_val is not None else s.amount,
+                "Status": s.status,
             })
         pd.DataFrame(rows).to_excel(writer, sheet_name="PO Styles", index=False)
 
-        # Sheet 2 & 3 – size charts
+        # Sheet 2 & 3 – size charts (verified spec)
         for ch in BUILTIN_CHARTS:
             chart_to_df(ch).to_excel(writer, sheet_name=ch["id"], index=False)
 
@@ -249,8 +359,10 @@ def metric(col, label, value):
         unsafe_allow_html=True,
     )
 
+
 def sec(text):
     st.markdown(f'<div class="sh">{text}</div>', unsafe_allow_html=True)
+
 
 def badges(items):
     st.markdown(
@@ -259,15 +371,35 @@ def badges(items):
     )
 
 
+def render_status_badge(status: str) -> str:
+    s = status.upper()
+    if s == "OK":
+        cls = "status-ok"
+        txt = "OK"
+    elif s == "MISMATCH":
+        cls = "status-err"
+        txt = "Amount mismatch"
+    elif s == "MISSING_FIELDS":
+        cls = "status-warn"
+        txt = "Missing fields"
+    elif s == "BAD_CODE":
+        cls = "status-warn"
+        txt = "Unusual style code"
+    else:
+        cls = "status-warn"
+        txt = s
+    return f'<span class="{cls}">{txt}</span>'
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # HEADER
 # ═════════════════════════════════════════════════════════════════════════════
 
 st.markdown("# 📏 Supplier PO — Size Chart Extractor")
 st.markdown(
-    "Upload the supplier PDF to see all **32 style variants** and the "
-    "**correct size measurement tables** for comparison with your "
-    "**MF Template Matrix Detail** screen."
+    "Upload the supplier PDF to see PO style variants and the "
+    "size measurement tables for comparison with your **MF Template Matrix Detail** screen. "
+    "This version adds strict validation so doubtful data is clearly flagged."
 )
 st.divider()
 
@@ -278,18 +410,16 @@ st.divider()
 uploaded = st.file_uploader(
     "Drop supplier PO PDF here",
     type=["pdf"],
-    help="Supports SI4大童长裤 PO format (102-SY0002). PMY style rows are parsed from text; "
-         "size measurement tables are built-in because page 4 data is image-embedded.",
+    help="Text-based PDFs give best results. Image-only pages may require manual spec or OCR in a later version.",
 )
 
 if not uploaded:
-    # Show built-in charts even before upload
     st.info(
-        "👆 Upload the PDF to load PO style data.  \n"
-        "**Size measurement tables are shown below right now** — "
-        "they are always available because the data is built into this tool."
+        "👆 Upload a PO PDF to load PO style data.  \n"
+        "**Size measurement tables below are from a known verified spec** "
+        "(built-in for this kids pants format)."
     )
-    st.markdown("### 📋 Size Measurement Tables (always available)")
+    st.markdown("### 📋 Size Measurement Tables (verified config)")
     for ch in BUILTIN_CHARTS:
         with st.expander(f"📐 {ch['title']}  —  Fabric: {ch['fabric']}", expanded=True):
             st.caption(f"Applies to styles: **{', '.join(ch['applies_to'])}**  |  Unit: {ch['unit']}")
@@ -304,16 +434,29 @@ file_bytes = uploaded.read()
 with st.spinner("Reading PO table…"):
     po_styles = parse_po(file_bytes)
 
-n_po = len(po_styles)
+summary = validate_po(po_styles)
+n_po = summary["count"]
 
-if n_po == 0:
-    st.warning("⚠️ Could not parse any PMY style rows. Check Debug section below.")
+# Global banner
+if summary["status"] == "EMPTY":
+    st.error("❌ No PO style rows parsed. Check PDF format or try another file.")
+elif summary["status"] == "MISMATCH":
+    st.error(
+        f"⚠️ Parsed {n_po} styles. {summary['message']}  \n"
+        f"Total pieces: **{summary['total_qty']:,.0f}**  |  "
+        f"Total amount (parsed): **¥{summary['total_amt']:,.0f}**"
+    )
+elif summary["status"] == "WARN":
+    st.warning(
+        f"⚠️ Parsed {n_po} styles with some warnings. {summary['message']}  \n"
+        f"Total pieces: **{summary['total_qty']:,.0f}**  |  "
+        f"Total amount (parsed): **¥{summary['total_amt']:,.0f}**"
+    )
 else:
-    col1, col2 = st.columns([3, 1])
-    col1.success(
-        f"✅ Loaded **{n_po} PO style variants** from the order table.  \n"
-        f"Size measurement tables are **built-in** (page 4 data is image-embedded, "
-        f"not readable as text — this is normal for this supplier's format)."
+    st.success(
+        f"✅ Parsed **{n_po} PO style variants**. {summary['message']}  \n"
+        f"Total pieces: **{summary['total_qty']:,.0f}**  |  "
+        f"Total amount (parsed): **¥{summary['total_amt']:,.0f}**"
     )
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -331,20 +474,31 @@ with st.sidebar:
     if view in ["🧾 PO Styles", "📌 Compare"]:
         st.divider()
         st.markdown("#### 🔍 Filter")
-        q          = st.text_input("Style code", placeholder="PMY009…")
-        f_colors   = st.multiselect("Color",  sorted({s.color  for s in po_styles if s.color}))
-        f_fabrics  = st.multiselect("Fabric", sorted({s.fabric for s in po_styles if s.fabric}))
+        q = st.text_input("Style code", placeholder="PMY009 / TVJ135…")
+        f_colors = st.multiselect("Color", sorted({s.color for s in po_styles if s.color}))
+        f_fabrics = st.multiselect("Fabric", sorted({s.fabric for s in po_styles if s.fabric}))
+        f_status = st.multiselect(
+            "Status",
+            options=["OK", "MISMATCH", "MISSING_FIELDS", "BAD_CODE"],
+        )
 
         fp = po_styles
-        if q:         fp = [s for s in fp if q.lower() in s.code.lower()]
-        if f_colors:  fp = [s for s in fp if s.color  in f_colors]
-        if f_fabrics: fp = [s for s in fp if s.fabric in f_fabrics]
+        if q:
+            fp = [s for s in fp if q.lower() in s.code.lower()]
+        if f_colors:
+            fp = [s for s in fp if s.color in f_colors]
+        if f_fabrics:
+            fp = [s for s in fp if s.fabric in f_fabrics]
+        if f_status:
+            fp = [s for s in fp if s.status in f_status]
     else:
         fp = po_styles
 
     st.divider()
-    st.markdown("<small style='color:#555'>Compare with Template Matrix Detail</small>",
-                unsafe_allow_html=True)
+    st.markdown(
+        "<small style='color:#555'>Green = fully validated  •  Orange/Red = check with original PO</small>",
+        unsafe_allow_html=True,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -353,27 +507,24 @@ with st.sidebar:
 if view == "📊 Dashboard":
     st.subheader("📊 Order Summary")
 
-    total_qty = 0
-    total_amt = 0.0
+    total_qty = summary["total_qty"]
+    total_amt = summary["total_amt"]
     fabric_cnt: Dict[str, int] = {}
+    status_cnt: Dict[str, int] = {}
 
     for s in po_styles:
-        n = re.sub(r"[^\d]", "", s.qty)
-        if n: total_qty += int(n)
-        a = s.amount.replace("¥","").replace(",","").strip()
-        try: total_amt += float(a)
-        except ValueError: pass
         fab = s.fabric or "Unknown"
         fabric_cnt[fab] = fabric_cnt.get(fab, 0) + 1
+        status_cnt[s.status] = status_cnt.get(s.status, 0) + 1
 
     unique_models = len({s.code.split("-")[0] for s in po_styles})
 
     c1, c2, c3, c4 = st.columns(4)
     for col, num, desc in [
-        (c1, str(unique_models),   "Unique models"),
-        (c2, str(n_po),            "Color variants"),
-        (c3, f"{total_qty:,}",     "Total pieces"),
-        (c4, f"¥{total_amt:,.0f}", "Total order value"),
+        (c1, str(unique_models), "Unique models"),
+        (c2, str(n_po), "Color variants"),
+        (c3, f"{total_qty:,.0f}", "Total pieces (parsed)"),
+        (c4, f"¥{total_amt:,.0f}", "Total order value (parsed)"),
     ]:
         with col:
             st.markdown(
@@ -394,18 +545,9 @@ if view == "📊 Dashboard":
         st.dataframe(fab_df, use_container_width=True, hide_index=True)
 
     with cr:
-        sec("Top 10 styles by value")
-        rows = []
-        for s in po_styles:
-            a = s.amount.replace("¥","").replace(",","").strip()
-            try: amt = float(a)
-            except ValueError: amt = 0.0
-            rows.append({"Style": s.code, "Color": s.color, "¥ Amount": amt})
-        if rows:
-            st.dataframe(
-                pd.DataFrame(rows).sort_values("¥ Amount", ascending=False).head(10),
-                use_container_width=True, hide_index=True,
-            )
+        sec("Line status summary")
+        rows = [{"Status": k, "Rows": v} for k, v in status_cnt.items()]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     sec("Export")
@@ -423,13 +565,13 @@ if view == "📊 Dashboard":
 # 📋  SIZE CHARTS
 # ═════════════════════════════════════════════════════════════════════════════
 elif view == "📋 Size Charts":
-    st.subheader("📋 Size Measurement Tables")
+    st.subheader("📋 Size Measurement Tables (verified)")
 
     st.markdown(
-        '<div class="notice">ℹ️ These measurement tables come from <b>page 4</b> of the supplier PDF. '
-        'That page stores its data as embedded images — not readable text — so pdfplumber cannot '
-        'extract the numbers automatically. The values below are hard-coded from the known spec and '
-        'are <b>always correct</b> for this PO format.</div>',
+        '<div class="notice">ℹ️ These measurement tables come from a '
+        '<b>manually verified spec</b> for this kids pants format. '
+        'Supplier PDF may store them as embedded images. '
+        'Values here are from your saved config, not OCR guesses.</div>',
         unsafe_allow_html=True,
     )
 
@@ -439,9 +581,9 @@ elif view == "📋 Size Charts":
     ch = BUILTIN_CHARTS[sel]
 
     c1, c2, c3 = st.columns(3)
-    metric(c1, "Style group",   ch["title"])
-    metric(c2, "Fabric code",   ch["fabric"])
-    metric(c3, "Applies to",    "  ".join(ch["applies_to"]))
+    metric(c1, "Style group", ch["title"])
+    metric(c2, "Fabric code", ch["fabric"])
+    metric(c3, "Applies to", "  ".join(ch["applies_to"]))
 
     st.markdown("<br>", unsafe_allow_html=True)
     sec("Sizes in spec")
@@ -458,7 +600,7 @@ elif view == "📋 Size Charts":
         with st.expander("📊 Quick stats"):
             st.markdown(f"- **Measurements:** {len(ch['rows'])}")
             st.markdown(f"- **Sizes:** {len(ch['sizes'])}")
-            st.markdown("- 💡 Compare with Template Matrix Detail")
+            st.markdown("- 💡 Compare with MF Template Matrix Detail")
 
     with cr:
         sec("Copy-paste text block")
@@ -492,23 +634,27 @@ elif view == "🧾 PO Styles":
 
     st.caption(f"Showing **{len(fp)}** of **{n_po}** styles")
 
-    labels  = [f"{s.code}  –  {s.color}" for s in fp]
+    labels = [f"{s.code}  –  {s.color}" for s in fp]
     sel_idx = st.selectbox("Select style", range(len(labels)),
                            format_func=lambda i: labels[i])
     s = fp[sel_idx]
 
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1, c2, c3, c4, c5 = st.columns(5)
     for col, lbl, val in [
-        (c1,"Style",   s.code),
-        (c2,"Product", s.product),
-        (c3,"Color",   s.color),
-        (c4,"Fabric",  s.fabric or "—"),
-        (c5,"Qty",     s.qty or "—"),
+        (c1, "Style", s.code),
+        (c2, "Product", s.product),
+        (c3, "Color", s.color),
+        (c4, "Fabric", s.fabric or "—"),
+        (c5, "Qty", s.qty or "—"),
     ]:
         metric(col, lbl, val)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    sec("Row status")
+    st.markdown(render_status_badge(s.status), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
     sec("Sizes in spec")
     badges(s.sizes) if s.sizes else st.markdown("*not parsed*")
     st.markdown("<br>", unsafe_allow_html=True)
@@ -528,18 +674,45 @@ elif view == "🧾 PO Styles":
 
     st.markdown("**Order details:**")
     st.table(pd.DataFrame({
-        "Field": ["Style","Product","Color","Fabric","Sizes","Qty","Unit price","Amount"],
+        "Field": ["Style", "Product", "Color", "Fabric",
+                  "Sizes", "Qty", "Unit price", "Amount", "Status"],
         "Value": [s.code, s.product, s.color, s.fabric or "—",
                   ", ".join(s.sizes) or "—",
-                  s.qty or "—", s.price or "—", s.amount or "—"],
+                  s.qty or "—", s.price or "—", s.amount or "—", s.status],
     }))
 
     sec("All filtered styles")
-    st.dataframe(pd.DataFrame([{
-        "Style": x.code, "Color": x.color, "Fabric": x.fabric,
-        "Sizes": ", ".join(x.sizes), "Qty": x.qty,
-        "Price": x.price, "Amount": x.amount,
-    } for x in fp]), use_container_width=True, hide_index=True)
+    df_rows = []
+    for x in fp:
+        df_rows.append({
+            "Style": x.code,
+            "Color": x.color,
+            "Fabric": x.fabric,
+            "Sizes": ", ".join(x.sizes),
+            "Qty": x.qty,
+            "Price": x.price,
+            "Amount": x.amount,
+            "Status": x.status,
+        })
+
+    df = pd.DataFrame(df_rows)
+
+    # style status column with colors in dataframe
+    def color_status(val):
+        v = str(val).upper()
+        if v == "OK":
+            return "background-color:#022c22;color:#6ee7b7;"
+        if v == "MISMATCH":
+            return "background-color:#450a0a;color:#fecaca;"
+        if v in ("MISSING_FIELDS", "BAD_CODE"):
+            return "background-color:#451a03;color:#fed7aa;"
+        return ""
+
+    st.dataframe(
+        df.style.applymap(color_status, subset=["Status"]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -548,16 +721,16 @@ elif view == "🧾 PO Styles":
 elif view == "📌 Compare":
     st.subheader("📌 Side-by-Side Size Chart Comparison")
 
-    names = [f"{ch['title']}  (Fabric: {ch['fabric']})" for ch in BUILTIN_CHARTS]
+    chart_names = [f"{ch['title']}  (Fabric: {ch['fabric']})" for ch in BUILTIN_CHARTS]
 
     cp1, cp2 = st.columns(2)
     with cp1:
-        a_idx = st.selectbox("Chart A", range(len(names)),
-                             format_func=lambda i: names[i], key="ca")
+        a_idx = st.selectbox("Chart A", range(len(chart_names)),
+                             format_func=lambda i: chart_names[i], key="ca")
     with cp2:
-        b_idx = st.selectbox("Chart B", range(len(names)),
-                             index=min(1, len(names)-1),
-                             format_func=lambda i: names[i], key="cb")
+        b_idx = st.selectbox("Chart B", range(len(chart_names)),
+                             index=min(1, len(chart_names)-1),
+                             format_func=lambda i: chart_names[i], key="cb")
 
     ca, cb = BUILTIN_CHARTS[a_idx], BUILTIN_CHARTS[b_idx]
     dfa, dfb = chart_to_df(ca), chart_to_df(cb)
@@ -578,7 +751,7 @@ elif view == "📌 Compare":
         st.dataframe(dfb, use_container_width=True, hide_index=True)
 
     # Δ diff (only if same number of sizes)
-    common_meas  = set(dfa["Measurement"]) & set(dfb["Measurement"])
+    common_meas = set(dfa["Measurement"]) & set(dfb["Measurement"])
     common_sizes = [sz for sz in ca["sizes"] if sz in cb["sizes"]]
 
     if common_meas and common_sizes:
@@ -600,7 +773,8 @@ elif view == "📌 Compare":
         diff_df = pd.DataFrame(diff_rows)
 
         def color_diff(v):
-            if v == "—" or v == 0: return ""
+            if v == "—" or v == 0:
+                return ""
             try:
                 return "color:#f87171" if float(v) < 0 else "color:#34d399"
             except (ValueError, TypeError):
@@ -622,8 +796,8 @@ elif view == "📌 Compare":
 st.divider()
 with st.expander("🔍 Debug: raw PDF text"):
     st.markdown(
-        "**Note:** Page 4 will show `(no text — likely image)` — "
-        "this is expected and is why size tables are built-in.",
+        "**Note:** Image-only pages will show `(no text — likely image)` — "
+        "those may need OCR or saved size spec config.",
         unsafe_allow_html=False,
     )
     raw = get_raw_text(file_bytes, 6000)
